@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -26,10 +25,24 @@ const GAME_HEIGHT = 400;
 const rooms = new Map();
 const players = new Map();
 
+// Generar código corto amigable (ej: A3K9X2)
+function generateRoomCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin I, O, 0, 1 para evitar confusión
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    // Evitar colisiones
+    if (rooms.has(code)) return generateRoomCode();
+    return code;
+}
+
 // Estructura de sala
 class GameRoom {
-    constructor(roomId) {
+    constructor(roomId, roomName, hostName) {
         this.roomId = roomId;
+        this.roomName = roomName || `Sala ${roomId}`;
+        this.hostName = hostName || 'Anónimo';
         this.players = {};
         this.gameState = {
             ball: {
@@ -54,6 +67,7 @@ class GameRoom {
         };
         this.isPlaying = false;
         this.gameSpeed = 1;
+        this.createdAt = Date.now();
     }
 
     addPlayer(socketId, playerNumber, username) {
@@ -73,6 +87,13 @@ class GameRoom {
 
     getPlayerCount() {
         return Object.keys(this.players).length;
+    }
+
+    getPlayersInfo() {
+        return Object.values(this.players).map(p => ({
+            username: p.username,
+            playerNumber: p.playerNumber
+        }));
     }
 
     updatePlayerInput(socketId, direction, pressed) {
@@ -175,6 +196,21 @@ class GameRoom {
     }
 }
 
+// Helper para enviar lista de salas actualizada
+function broadcastRoomsList() {
+    const roomsList = Array.from(rooms.values())
+        .filter(room => !room.isPlaying && room.getPlayerCount() < 2)
+        .map(room => ({
+            roomId: room.roomId,
+            roomName: room.roomName,
+            hostName: room.hostName,
+            players: room.getPlayerCount(),
+            maxPlayers: 2,
+            isPlaying: room.isPlaying
+        }));
+    io.emit('rooms_list', roomsList);
+}
+
 // ==================== RUTAS HTTP ====================
 app.get('/', (req, res) => {
     res.json({ message: 'Servidor Pong Online activo', status: 'running' });
@@ -183,7 +219,10 @@ app.get('/', (req, res) => {
 app.get('/api/rooms', (req, res) => {
     const roomsList = Array.from(rooms.values()).map(room => ({
         roomId: room.roomId,
+        roomName: room.roomName,
+        hostName: room.hostName,
         players: room.getPlayerCount(),
+        maxPlayers: 2,
         isPlaying: room.isPlaying
     }));
     res.json(roomsList);
@@ -197,12 +236,41 @@ app.get('/api/health', (req, res) => {
 io.on('connection', (socket) => {
     console.log(`Jugador conectado: ${socket.id}`);
 
-    // Crear sala
+    // Enviar lista de salas al conectar
+    const roomsList = Array.from(rooms.values())
+        .filter(room => !room.isPlaying && room.getPlayerCount() < 2)
+        .map(room => ({
+            roomId: room.roomId,
+            roomName: room.roomName,
+            hostName: room.hostName,
+            players: room.getPlayerCount(),
+            maxPlayers: 2,
+            isPlaying: room.isPlaying
+        }));
+    socket.emit('rooms_list', roomsList);
+
+    // Pedir lista de salas
+    socket.on('get_rooms', () => {
+        const list = Array.from(rooms.values())
+            .filter(room => !room.isPlaying && room.getPlayerCount() < 2)
+            .map(room => ({
+                roomId: room.roomId,
+                roomName: room.roomName,
+                hostName: room.hostName,
+                players: room.getPlayerCount(),
+                maxPlayers: 2,
+                isPlaying: room.isPlaying
+            }));
+        socket.emit('rooms_list', list);
+    });
+
+    // Crear sala con nombre amigable
     socket.on('create_room', (data) => {
-        const roomId = `room_${Date.now()}`;
-        const room = new GameRoom(roomId);
+        const roomId = generateRoomCode();
+        const roomName = (data.roomName || '').trim() || `Sala de ${data.username || 'Anónimo'}`;
+        const room = new GameRoom(roomId, roomName, data.username || 'Anónimo');
         const playerNumber = 1;
-        
+
         room.addPlayer(socket.id, playerNumber, data.username || 'Anónimo');
         rooms.set(roomId, room);
         players.set(socket.id, { roomId, playerNumber });
@@ -210,11 +278,13 @@ io.on('connection', (socket) => {
         socket.join(roomId);
         socket.emit('room_created', {
             roomId,
+            roomName: room.roomName,
             playerNumber,
-            message: `Sala creada. Esperando jugador 2...`
+            message: `Sala "${room.roomName}" creada. Esperando jugador 2...`
         });
 
-        console.log(`Sala creada: ${roomId}`);
+        broadcastRoomsList();
+        console.log(`Sala creada: ${roomId} ("${room.roomName}")`);
     });
 
     // Unirse a sala
@@ -232,6 +302,11 @@ io.on('connection', (socket) => {
             return;
         }
 
+        if (room.isPlaying) {
+            socket.emit('error', { message: 'La partida ya comenzó' });
+            return;
+        }
+
         const playerNumber = 2;
         room.addPlayer(socket.id, playerNumber, data.username || 'Anónimo');
         players.set(socket.id, { roomId, playerNumber });
@@ -239,18 +314,20 @@ io.on('connection', (socket) => {
         socket.join(roomId);
         socket.emit('room_joined', {
             roomId,
+            roomName: room.roomName,
             playerNumber,
-            message: `Te uniste a la sala. ¡La partida comienza!`
+            message: `Te uniste a "${room.roomName}". ¡La partida comienza!`
         });
 
         // Notificar al otro jugador
         io.to(roomId).emit('player_joined', {
-            player1: room.players[Object.keys(room.players)[0]]?.username,
-            player2: room.players[Object.keys(room.players)[1]]?.username,
+            roomName: room.roomName,
+            players: room.getPlayersInfo(),
             canStart: room.getPlayerCount() === 2
         });
 
-        console.log(`Jugador ${socket.id} se unió a la sala ${roomId}`);
+        broadcastRoomsList();
+        console.log(`Jugador ${socket.id} se unió a la sala ${roomId} ("${room.roomName}")`);
     });
 
     // Iniciar juego
@@ -268,6 +345,7 @@ io.on('connection', (socket) => {
         });
 
         startGameLoop(playerData.roomId);
+        broadcastRoomsList(); // la sala ya no aparece como disponible
     });
 
     // Recibir input del jugador
@@ -296,6 +374,7 @@ io.on('connection', (socket) => {
                         message: 'El otro jugador se desconectó'
                     });
                 }
+                broadcastRoomsList();
             }
             players.delete(socket.id);
         }
@@ -320,7 +399,7 @@ const gameLoops = new Set();
 
 function startGameLoop(roomId) {
     if (gameLoops.has(roomId)) return;
-    
+
     gameLoops.add(roomId);
 
     const interval = setInterval(() => {
